@@ -1,0 +1,25 @@
+name: appkettle
+description: "AppKettle test"
+version: "1.0.0"
+slug: "appkettle_mqtt"
+init: false
+arch:
+  - aarch64
+  - amd64
+  - armhf
+  - armv7
+  - i386
+startup: before
+homeassistant_api: true
+hassio_api: true
+host_network: true
+options:
+  mqtt_host: ""
+  mqtt_port: 1883
+  mqtt_usr: ""
+  mqtt_pwd: ""
+schema:
+  mqtt_host: str
+  mqtt_port: int
+  mqtt_usr: str
+  mqtt_pwd: password
