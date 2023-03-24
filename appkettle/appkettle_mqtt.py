@@ -556,7 +556,6 @@ def main_loop(host_port, imei, mqtt_broker, lvl_calib):
                           "command_topic": MQTT_COMMAND_TOPIC + "/set_target_temp",
                           "unique_id": "kettle_target_temp",
                           "unit_of_measurement": "°C",
-                          "retain": True,
                           "icon": "mdi:thermometer-check"
                       }), retain=True)
         mqttc.publish(MQTT_SENSOR_DISC_TOPIC + "/current_temp/config",
@@ -576,7 +575,6 @@ def main_loop(host_port, imei, mqtt_broker, lvl_calib):
                           "state_topic": MQTT_STATUS_TOPIC + "/temperature",
                           "unique_id": "kettle_temp",
                           "unit_of_measurement": "°C",
-                          "retain": True,
                           "icon": "mdi:water-thermometer"
                       }), retain=True)
         mqttc.publish(MQTT_SENSOR_DISC_TOPIC + "/fill_level/config",
@@ -596,7 +594,6 @@ def main_loop(host_port, imei, mqtt_broker, lvl_calib):
                           "state_topic": MQTT_STATUS_TOPIC + "/STATE",
                           "unique_id": "kettle_fill_level",
                           "unit_of_measurement": "%",
-                          "retain": True,
                           "icon": "mdi:cup-water",
                           "value_template": "{{ (min(100, max(0, (((value_json.volume - " + str(lvl_calib[0]) + ") / (" + str(lvl_calib[1]) + " - " + str(lvl_calib[0]) + ")) * 100)|round(0)))) }}"
                       }), retain=True)
@@ -616,7 +613,6 @@ def main_loop(host_port, imei, mqtt_broker, lvl_calib):
                           "name": "Kettle Water Volume",
                           "state_topic": MQTT_STATUS_TOPIC + "/volume",
                           "unique_id": "kettle_water_volume",
-                          "retain": True,
                           "icon": "mdi:cup-water",
                           "hidden": True
                       }), retain=True)
