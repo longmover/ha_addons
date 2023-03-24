@@ -34,6 +34,9 @@ import select
 import signal
 import json
 import argparse
+#import machine
+#import ubinascii
+#from machine import Pin
 import paho.mqtt.client as mqtt     # pip install paho.mqtt
 from Cryptodome.Cipher import AES   # pip install pycryptodomex
 
@@ -61,6 +64,13 @@ UDP_PORT = 15103
 MQTT_BASE = "appKettle/"
 MQTT_COMMAND_TOPIC = MQTT_BASE + "command"
 MQTT_STATUS_TOPIC = MQTT_BASE + "status"
+MQTT_AVAILABILITY_TOPIC = MQTT_BASE + "state"
+MQTT_DEVICE_ID = "appKettle"
+MQTT_SWITCH_DISC_TOPIC = "homeassistant/switch/" + MQTT_DEVICE_ID
+MQTT_SENSOR_DISC_TOPIC = "homeassistant/sensor/" + MQTT_DEVICE_ID
+MQTT_DEVICE_NAME = "appKettle"
+MQTT_DEVICE_MANUFACTURER = "appKettle"
+MQTT_DEVICE_MODEL = "appKettle"
 
 # AES secrets:
 SECRET_KEY = b"ay3$&dw*ndAD!9)<"
@@ -199,7 +209,8 @@ class KettleSocket:
                 self.connected = True
                 return
             except (TimeoutError, OSError) as err:
-                print("Socket error: ", err, " | ", attempts, "attempts remaining")
+                print("Socket error: ", err, " | ",
+                      attempts, "attempts remaining")
                 self.kettle_probe()  # run kettle probe to try to wake up the kettle
                 attempts -= 1
                 self.connected = False
@@ -216,16 +227,19 @@ class KettleSocket:
         Example probe message: "Probe#2020-05-05-10-47-15-2"
         """
 
-#        for i in range(1, 4):
         while True:
-            send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)  # UDP socket
-            rcv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)  # UDP socket
+            send_sock = socket.socket(
+                socket.AF_INET, socket.SOCK_DGRAM)  # UDP socket
+            rcv_sock = socket.socket(
+                socket.AF_INET, socket.SOCK_DGRAM)  # UDP socket
             send_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
             for _i in range(1, 4):
                 # send 4 packets
-                prb = time.strftime("Probe#%Y-%m-%d-%H-%M-%S", time.localtime())
-                send_sock.sendto(str.encode(prb, "ascii"), (UDP_IP_BCAST, UDP_PORT))
+                prb = time.strftime(
+                    "Probe#%Y-%m-%d-%H-%M-%S", time.localtime())
+                send_sock.sendto(str.encode(prb, "ascii"),
+                                 (UDP_IP_BCAST, UDP_PORT))
 
             send_sock.close()
             print("Sent broadcast messages, waiting to hear back from kettle...")
@@ -241,7 +255,8 @@ class KettleSocket:
             rcv_sock.close()
 
             msg = data.split("#")
-            msg_json = json.loads(msg[6])  # item 6 has a JSON message with some info
+            # item 6 has a JSON message with some info
+            msg_json = json.loads(msg[6])
             msg_json.update({"imei": msg[0]})
             msg_json.update({"version": msg[3]})
             msg_json.update({"kettleIP": address[0]})
@@ -386,7 +401,8 @@ class KettleSocket:
         else:
             content = msg.encode()
             header = PLAIN_HEADER
-        encoded_msg = header + bytes("%0.2X" % len(content), "utf-8") + content + b"&&"
+        encoded_msg = header + bytes("%0.2X" %
+                                     len(content), "utf-8") + content + b"&&"
         self.send(encoded_msg)
         if DEBUG_MSG:
             unpack_msg(to_json(msg))
@@ -399,7 +415,7 @@ def cb_mqtt_on_connect(client, kettle, flags, rec_code):
     # Subscribing in on_connect() means that if we lose the connection and
     # reconnect then subscriptions will be renewed.
     client.subscribe(MQTT_COMMAND_TOPIC + "/#")  # subscribe to all topics
-    
+
 
 def cb_mqtt_on_message(mqttc, kettle, msg):
     """ The callback for when a PUBLISH message is received from the server. """
@@ -423,13 +439,15 @@ def cb_mqtt_on_message(mqttc, kettle, msg):
         else:
             print("MQTT MSG: msg not recognised:", msg)
         mqttc.publish(
-            MQTT_STATUS_TOPIC + "/keep_warm_onoff", kettle.stat["keep_warm_onoff"]
+            MQTT_STATUS_TOPIC +
+            "/keep_warm_onoff", kettle.stat["keep_warm_onoff"]
         )
 
     elif msg.topic == MQTT_COMMAND_TOPIC + "/set_target_temp":
         kettle.stat["set_target_temp"] = int(msg.payload)
         mqttc.publish(
-            MQTT_STATUS_TOPIC + "/set_target_temp", kettle.stat["set_target_temp"]
+            MQTT_STATUS_TOPIC +
+            "/set_target_temp", kettle.stat["set_target_temp"]
         )
 
 
@@ -442,14 +460,20 @@ def to_json(myjson):
     return json_object
 
 
-def main_loop(host_port, imei, mqtt_broker):
+def main_loop(host_port, imei, mqtt_broker, lvl_calib):
     """ Main event loop called from __main__
 
     Args:
         host_port: tuple with the kettle host and port
         imei: kettle IMEI
         mqtt_broker: array with mqtt broker ip, port, username & password
+        lvl_calib: array with the calibration levels for the kettle
     """
+    # if lvl_calib is empty, use default values
+    if not lvl_calib:
+        lvl_calib = [160, 1640]
+
+    print(lvl_calib)
 
     kettle_socket = KettleSocket(imei=imei)
     kettle = AppKettle(kettle_socket)
@@ -463,9 +487,141 @@ def main_loop(host_port, imei, mqtt_broker):
             mqttc.username_pw_set(mqtt_broker[2], password=mqtt_broker[3])
         mqttc.on_connect = cb_mqtt_on_connect
         mqttc.on_message = cb_mqtt_on_message
-        mqttc.user_data_set(kettle)  # passes to each callback $kettle as $userdata
-        mqttc.will_set(MQTT_STATUS_TOPIC + "/status", "Disconnected", retain=True)
+        # passes to each callback $kettle as $userdata
+        mqttc.user_data_set(kettle)
+        mqttc.will_set(MQTT_AVAILABILITY_TOPIC,
+                       "offline", retain=True)
         mqttc.connect(mqtt_broker[0], int(mqtt_broker[1]))
+        mqttc.publish(MQTT_AVAILABILITY_TOPIC, "online", retain=True)
+        
+        # publish HA discovery topics
+        mqttc.publish(MQTT_SWITCH_DISC_TOPIC + "/power/config",
+                      json.dumps({
+                          "availability": [
+                              {
+                                  "topic": MQTT_AVAILABILITY_TOPIC
+                              }
+                          ],
+                          "command_topic": MQTT_COMMAND_TOPIC + "/power",
+                          "device": {
+                              "identifiers": MQTT_DEVICE_NAME,
+                              "manufacturer": MQTT_DEVICE_MANUFACTURER,
+                              "model": MQTT_DEVICE_MODEL,
+                              "name": MQTT_DEVICE_NAME
+                          },
+                          "name": "Kettle Power",
+                          "state_topic": MQTT_STATUS_TOPIC + "/power",
+                          "unique_id": "kettle_power",
+                          "payload_on": "ON",
+                          "payload_off": "OFF",
+                          "icon": "mdi:kettle"
+                      }), retain=True)
+        mqttc.publish(MQTT_SWITCH_DISC_TOPIC + "/keep_warm_onoff/config",
+                      json.dumps({
+                          "availability": [
+                              {
+                                  "topic": MQTT_AVAILABILITY_TOPIC
+
+                              }
+                          ],
+                          "device": {
+                              "identifiers": MQTT_DEVICE_NAME,
+                              "manufacturer": MQTT_DEVICE_MANUFACTURER,
+                              "model": MQTT_DEVICE_MODEL,
+                              "name": MQTT_DEVICE_NAME
+                          },
+                          "name": "Kettle Keep Warm",
+                          "state_topic": MQTT_STATUS_TOPIC + "/keep_warm_onoff",
+                          "command_topic": MQTT_COMMAND_TOPIC + "/keep_warm_onoff",
+                          "unique_id": "kettle_keep_warm",
+                          "payload_on": "True",
+                          "payload_off": "False",
+                          "icon": "mdi:kettle-steam"
+                      }), retain=True)
+        mqttc.publish(MQTT_SENSOR_DISC_TOPIC + "/set_target_temp/config",
+                      json.dumps({
+                          "availability": [
+                              {
+                                  "topic": MQTT_AVAILABILITY_TOPIC
+                              }
+                          ],
+                          "device": {
+                              "identifiers": MQTT_DEVICE_NAME,
+                              "manufacturer": MQTT_DEVICE_MANUFACTURER,
+                              "model": MQTT_DEVICE_MODEL,
+                              "name": MQTT_DEVICE_NAME
+                          },
+                          "name": "Kettle Target Temperature",
+                          "state_topic": MQTT_STATUS_TOPIC + "/set_target_temp",
+                          "command_topic": MQTT_COMMAND_TOPIC + "/set_target_temp",
+                          "unique_id": "kettle_target_temp",
+                          "unit_of_measurement": "°C",
+                          "retain": True,
+                          "icon": "mdi:thermometer-check"
+                      }), retain=True)
+        mqttc.publish(MQTT_SENSOR_DISC_TOPIC + "/current_temp/config",
+                      json.dumps({
+                          "availability": [
+                              {
+                                  "topic": MQTT_AVAILABILITY_TOPIC
+                              }
+                          ],
+                          "device": {
+                              "identifiers": MQTT_DEVICE_NAME,
+                              "manufacturer": MQTT_DEVICE_MANUFACTURER,
+                              "model": MQTT_DEVICE_MODEL,
+                              "name": MQTT_DEVICE_NAME
+                          },
+                          "name": "Kettle Current Temperature",
+                          "state_topic": MQTT_STATUS_TOPIC + "/temperature",
+                          "unique_id": "kettle_temp",
+                          "unit_of_measurement": "°C",
+                          "retain": True,
+                          "icon": "mdi:water-thermometer"
+                      }), retain=True)
+        mqttc.publish(MQTT_SENSOR_DISC_TOPIC + "/fill_level/config",
+                      json.dumps({
+                          "availability": [
+                              {
+                                  "topic": MQTT_AVAILABILITY_TOPIC
+                              }
+                          ],
+                          "device": {
+                              "identifiers": MQTT_DEVICE_NAME,
+                              "manufacturer": MQTT_DEVICE_MANUFACTURER,
+                              "model": MQTT_DEVICE_MODEL,
+                              "name": MQTT_DEVICE_NAME
+                          },
+                          "name": "Kettle Fill Level",
+                          "state_topic": MQTT_STATUS_TOPIC + "/STATE",
+                          "unique_id": "kettle_fill_level",
+                          "unit_of_measurement": "%",
+                          "retain": True,
+                          "icon": "mdi:cup-water",
+                          "value_template": "{{ (min(100, max(0, (((value_json.volume - " + str(lvl_calib[0]) + ") / (" + str(lvl_calib[1]) + " - " + str(lvl_calib[0]) + ")) * 100)|round(0)))) }}"
+                      }), retain=True)
+        mqttc.publish(MQTT_SENSOR_DISC_TOPIC + "/raw_fill_level/config",
+                      json.dumps({
+                          "availability": [
+                              {
+                                  "topic": MQTT_AVAILABILITY_TOPIC
+                              }
+                          ],
+                          "device": {
+                              "identifiers": MQTT_DEVICE_NAME,
+                              "manufacturer": MQTT_DEVICE_MANUFACTURER,
+                              "model": MQTT_DEVICE_MODEL,
+                              "name": MQTT_DEVICE_NAME
+                          },
+                          "name": "Kettle Water Volume",
+                          "state_topic": MQTT_STATUS_TOPIC + "/volume",
+                          "unique_id": "kettle_water_volume",
+                          "retain": True,
+                          "icon": "mdi:cup-water",
+                          "hidden": True
+                      }), retain=True)
+
+
         mqttc.loop_start()
 
     def cb_signal_handler(sig, frame):
@@ -530,7 +686,8 @@ def main_loop(host_port, imei, mqtt_broker):
             k_msg = kettle_socket.receive()
             kettle.update_status(k_msg)
             if not mqtt_broker is None:
-                mqttc.publish(MQTT_STATUS_TOPIC + "/STATE", kettle.status_json())
+                mqttc.publish(MQTT_STATUS_TOPIC + "/STATE",
+                              kettle.status_json())
                 for i in [
                     "temperature",
                     "target_temp",
@@ -563,7 +720,8 @@ def argparser():
     """Parses input arguments, see -h"""
     parser = argparse.ArgumentParser()
     parser.add_argument("host", nargs="?", help="kettle host or IP")
-    parser.add_argument("imei", nargs="?", help="kettle IMEI (e.g. GD0-12300-35aa)")
+    parser.add_argument("imei", nargs="?",
+                        help="kettle IMEI (e.g. GD0-12300-35aa)")
     parser.add_argument(
         "--port", help="kettle port (default 6002)", default=6002, type=int
     )
@@ -575,8 +733,16 @@ def argparser():
         metavar=("host", "port", "username", "password"),
     )
 
+    parser.add_argument(
+        "--calibrate",
+        help="Min and max volume values for the kettle water level sensor (e.g. --calibrate 0 100)",
+        nargs=2,
+        metavar=("lvl_min", "lvl_max"),
+    )
+
     args = parser.parse_args()
-    main_loop((args.host, args.port), args.imei, args.mqtt)
+
+    main_loop((args.host, args.port), args.imei, args.mqtt, args.calibrate)
 
 
 if __name__ == "__main__":
