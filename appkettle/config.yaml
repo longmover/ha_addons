@@ -1,6 +1,7 @@
-name: appkettle
-description: "AppKettle test"
-version: "1.0.0"
+name: AppKettle
+description: "A small addon which allows you to control your AppKettle through Home Assistant.  Important note: you must block internet access for you AppKettle to force it into local mode.  This can be done in several ways, including using a firewall or a router.  If you do not block internet access, the kettle will not permit local connections and will not be able to be controlled."
+version: "1.0.1"
+url: "https://github.com/longmover/ha_addons"
 slug: "appkettle_mqtt"
 init: false
 arch:
@@ -11,15 +12,18 @@ arch:
   - i386
 startup: before
 homeassistant_api: true
-hassio_api: true
 host_network: true
 options:
   mqtt_host: ""
   mqtt_port: 1883
   mqtt_usr: ""
   mqtt_pwd: ""
+  min_lvl: 160
+  max_lvl: 1640
 schema:
   mqtt_host: str
   mqtt_port: int
   mqtt_usr: str
   mqtt_pwd: password
+  min_lvl: int
+  max_lvl: int
