@@ -613,10 +613,26 @@ def main_loop(host_port, imei, mqtt_broker, lvl_calib):
                           "name": "Kettle Water Volume",
                           "state_topic": MQTT_STATUS_TOPIC + "/volume",
                           "unique_id": "kettle_water_volume",
-                          "icon": "mdi:cup-water",
-                          "hidden": True
+                          "icon": "mdi:cup-water"
                       }), retain=True)
-
+        mqttc.publish(MQTT_SENSOR_DISC_TOPIC + "/status/config",
+                      json.dumps({
+                          "availability": [
+                              {
+                                  "topic": MQTT_AVAILABILITY_TOPIC
+                              }
+                          ],
+                          "device": {
+                              "identifiers": MQTT_DEVICE_NAME,
+                              "manufacturer": MQTT_DEVICE_MANUFACTURER,
+                              "model": MQTT_DEVICE_MODEL,
+                              "name": MQTT_DEVICE_NAME
+                          },
+                          "name": "Kettle Status",
+                          "state_topic": MQTT_STATUS_TOPIC + "/status",
+                          "unique_id": "kettle_status",
+                          "icon": "mdi:kettle-alert"
+                      }), retain=True)
 
         mqttc.loop_start()
 
