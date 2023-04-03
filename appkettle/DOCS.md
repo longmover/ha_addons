@@ -2,11 +2,11 @@
 
 ## How to use
 
-Firstly you need to force the kettle into local operating mode, this is done by blocking its internet access.  How you do this is up to you and will be dependent on your network setup and abilities.
+Firstly you need to force the kettle into local operating mode, this is done by blocking its internet access.  How you do this is up to you and will be dependent on your network setup and abilities. Possible options are to restrict the kettle to a VLAN without internet access, to add a static DHCP reservation and block the its IP on your firewall or modify the DHCP options so that no default gateway is issued to the kettle.  You could also redirect DNS queries of jingxuncloud.com (the domain the kettle tries to access) to a dummy address.
 
 Once done, add the repo (https://github.com/longmover/ha_addons) to Home Assistant in the Addons section, refresh and install the addon
 
-Configure your MQTT server variables, save and start the addon.  You should see the kettle appear automatically in HA.  The sensors and controls are self explanatory.
+Configure your MQTT server variables, save and start the addon.  All being well the addon will discover your kettle and you should see it appear automatically in HA.  The sensors and controls are self explanatory.
 
 ## Calibrating the fill level sensor
 
