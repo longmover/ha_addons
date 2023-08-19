@@ -1,3 +1,6 @@
+## 1.0.3
+- Changed target temperature from sensor to number
+
 ## 1.0.2
 - Added kettle state sensor
 
