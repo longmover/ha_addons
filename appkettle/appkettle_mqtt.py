@@ -68,6 +68,7 @@ MQTT_AVAILABILITY_TOPIC = MQTT_BASE + "state"
 MQTT_DEVICE_ID = "appKettle"
 MQTT_SWITCH_DISC_TOPIC = "homeassistant/switch/" + MQTT_DEVICE_ID
 MQTT_SENSOR_DISC_TOPIC = "homeassistant/sensor/" + MQTT_DEVICE_ID
+MQTT_NUMBER_DISC_TOPIC = "homeassistant/number/" + MQTT_DEVICE_ID
 MQTT_DEVICE_NAME = "appKettle"
 MQTT_DEVICE_MANUFACTURER = "appKettle"
 MQTT_DEVICE_MODEL = "appKettle"
@@ -538,7 +539,7 @@ def main_loop(host_port, imei, mqtt_broker, lvl_calib):
                           "payload_off": "False",
                           "icon": "mdi:kettle-steam"
                       }), retain=True)
-        mqttc.publish(MQTT_SENSOR_DISC_TOPIC + "/set_target_temp/config",
+        mqttc.publish(MQTT_NUMBER_DISC_TOPIC + "/set_target_temp/config",
                       json.dumps({
                           "availability": [
                               {
@@ -556,7 +557,9 @@ def main_loop(host_port, imei, mqtt_broker, lvl_calib):
                           "command_topic": MQTT_COMMAND_TOPIC + "/set_target_temp",
                           "unique_id": "kettle_target_temp",
                           "unit_of_measurement": "°C",
-                          "icon": "mdi:thermometer-check"
+                          "icon": "mdi:thermometer-check",
+                          "max": 100,
+                          "min": 30
                       }), retain=True)
         mqttc.publish(MQTT_SENSOR_DISC_TOPIC + "/current_temp/config",
                       json.dumps({
