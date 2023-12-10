@@ -556,7 +556,7 @@ def main_loop(host_port, imei, mqtt_broker, lvl_calib):
                           "state_topic": MQTT_STATUS_TOPIC + "/set_target_temp",
                           "command_topic": MQTT_COMMAND_TOPIC + "/set_target_temp",
                           "unique_id": "kettle_target_temp",
-                          "unit_of_measurement": "°C",
+                          "unit_of_measurement": "C",
                           "icon": "mdi:thermometer-check",
                           "max": 100,
                           "min": 30
@@ -577,7 +577,7 @@ def main_loop(host_port, imei, mqtt_broker, lvl_calib):
                           "name": "Kettle Current Temperature",
                           "state_topic": MQTT_STATUS_TOPIC + "/temperature",
                           "unique_id": "kettle_temp",
-                          "unit_of_measurement": "°C",
+                          "unit_of_measurement": "C",
                           "icon": "mdi:water-thermometer"
                       }), retain=True)
         mqttc.publish(MQTT_SENSOR_DISC_TOPIC + "/fill_level/config",
@@ -698,8 +698,17 @@ def main_loop(host_port, imei, mqtt_broker, lvl_calib):
         infds, outfds, errfds = select.select(inout, inout, [], 120)
 
         if len(infds) != 0:
+            current_power = kettle.stat["power"]
+            current_cmd = kettle.stat["cmd"]
+
             k_msg = kettle_socket.receive()
             kettle.update_status(k_msg)
+
+            if current_power != kettle.stat["power"] and current_cmd != kettle.stat["power"]:
+                print("power changed: ", kettle.stat["power"])
+                mqttc.publish(MQTT_COMMAND_TOPIC + "/power", kettle.stat["power"])
+                
+
             if not mqtt_broker is None:
                 mqttc.publish(MQTT_STATUS_TOPIC + "/STATE",
                               kettle.status_json())
