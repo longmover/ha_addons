@@ -1,3 +1,6 @@
+## 1.0.4
+- Power command status now reflects manual power changes
+
 ## 1.0.3
 - Changed target temperature from sensor to number
 
