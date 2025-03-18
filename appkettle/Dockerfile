@@ -10,8 +10,9 @@ RUN \
 RUN \
   apk add -U g++ gcc
 
-RUN pip install paho.mqtt \
-  pycryptodomex
+RUN apk add --no-cache \
+      py3-paho-mqtt \
+      py3-pycryptodomex
 
 # Python 3 HTTP Server serves the current working dir
 # So let's set it to our add-on persistent data directory.
