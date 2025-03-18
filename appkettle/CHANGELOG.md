@@ -1,5 +1,5 @@
 ## 1.0.5
-- Updated python package names to address install error with python packages
+- Updated python package names to address install error
 
 ## 1.0.4
 - Power command status now reflects manual power changes
