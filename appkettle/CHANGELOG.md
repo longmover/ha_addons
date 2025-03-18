@@ -11,7 +11,7 @@
 - Added kettle state sensor
 
 ## 1.0.1
-- Removed redunant retain settings
+- Removed redundant retain settings
 
 ## 1.0.0
 
