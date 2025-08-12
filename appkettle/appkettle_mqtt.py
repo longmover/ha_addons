@@ -1,34 +1,41 @@
 #! /usr/bin/python3
 """Provides a running daemon for interfacing with an appKettle
 
-usage: appkettle_mqtt.py [-h] [--mqtt host port username password] [--bcast BCAST] [--calibrate lvl_min lvl_max] [--port PORT] [host] [imei]
+usage: appkettle_mqtt.py [-h]
+                         [--mqtt host port username password]
+                         [--bcast BCAST]
+                         [--src-ip SRC_IP]
+                         [--calibrate lvl_min lvl_max]
+                         [--port PORT]
+                         [host] [imei]
 
 arguments:
   host              kettle host or IP
-  imei              kettle imei (e.g. GD0-12300-35aa)
+  imei              kettle IMEI (e.g. GD0-12300-35aa)
 
 optional arguments:
   -h, --help        show this help message and exit
   --mqtt host port username password
                     MQTT broker host, port, username & password (e.g. --mqtt 192.168.0.1 1883 mqtt_user p@55w0Rd)
-  --bcast BCAST     Broadcast address for the subnet, defaults to 255.255.255.255 if not set
+  --bcast BCAST     Broadcast address override (default 255.255.255.255)
+  --src-ip SRC_IP   Source IP to bind UDP discovery sockets (choose NIC explicitly)
   --calibrate lvl_min lvl_max
                     Min and max volume values for the kettle water level sensor (e.g. --calibrate 160 1640)
   --port PORT       kettle port (default 6002)
 
-By default the both kettle and app talk via the cloud. Blocking internet access to
-the kettle host triggers communication on local network
+By default both kettle and app talk via the cloud. Blocking internet access to
+the kettle host triggers communication on local network.
 
-To find the IMEI and IP of the kettle run program without parameters
+To find the IMEI and IP of the kettle run program without parameters.
 
-Pressing Ctrl+C while this program is connected enters into a simple debug interface:
-see function cb_signal_handler for available commands
+Pressing Ctrl+C while this program is connected enters a simple debug interface:
+see function cb_signal_handler for available commands.
 
 To log and debug traffic from Android app, install tcpdump on a rooted Android phone:
 - adb shell
 - android:/# tcpdump [host 192.168.0.1] -i wlan0 -s0 -U -w - | nc -k -l -p 11111
 - adb forward tcp:11111 tcp:11111
-- connect this script to localhost:1111. Alternatively,
+- connect this script to localhost:11111. Alternatively,
     pipe traffic to wireshark (nc localhost 11111 | wireshark -k -S -i -)
 """
 
@@ -39,6 +46,11 @@ import select
 import signal
 import json
 import argparse
+from functools import partial
+
+# Make all prints flush immediately (useful under HA/s6 logs)
+print = partial(print, flush=True)
+
 #import machine
 #import ubinascii
 #from machine import Pin
@@ -49,9 +61,9 @@ from protocol_parser import unpack_msg, calc_msg_checksum
 
 DEBUG_MSG = True
 DEBUG_PRINT_STAT_MSG = False  # print status messages
-DEBUG_PRINT_KEEP_CONNECT = False  # print "keelconnect" packets
-SEND_ENCRYPTED = False  # use AES encryted comms with kettle
-MSGLEN = 3200  # max msg length: this needs to be long enough to allow a few msg to be received
+DEBUG_PRINT_KEEP_CONNECT = False  # print "keepconnect" packets
+SEND_ENCRYPTED = False  # use AES encrypted comms with kettle
+MSGLEN = 3200  # max msg length: large enough to allow a few msgs to be received
 
 KETTLE_SOCKET_CONNECT_ATTEMPTS = 3
 KETTLE_SOCKET_TIMEOUT_SECS = 60
@@ -60,7 +72,7 @@ KEEP_WARM_MINS = 10  # Default keep warm amount
 ENCRYPT_HEADER = bytes([0x23, 0x23, 0x38, 0x30])
 PLAIN_HEADER = bytes([0x23, 0x23, 0x30, 0x30])
 MSG_KEEP_CONNECT = b"##000bKeepConnect&&"
-MSG_KEEP_CONNECT_FREQ_SECS = 30  # sends a KeepConnect to keep connection live (e.g. app open)
+MSG_KEEP_CONNECT_FREQ_SECS = 30  # sends KeepConnect to keep connection live
 UDP_IP_BCAST_DEFAULT = "255.255.255.255"
 UDP_PORT = 15103
 
@@ -142,18 +154,8 @@ class AppKettle:
 
     def status_json(self):
         """Returns JSON message with the key status of the kettle"""
-        status_dict = {
-            key: self.stat[key]
-            for key in self.stat.keys()
-            & {
-                "power",
-                "status",
-                "temperature",
-                "target_temp",
-                "volume",
-                "keep_warm_secs",
-            }
-        }
+        keys = {"power", "status", "temperature", "target_temp", "volume", "keep_warm_secs"}
+        status_dict = {k: self.stat[k] for k in self.stat.keys() & keys}
         return json.dumps(status_dict)
 
     def update_status(self, msg):
@@ -181,13 +183,12 @@ class AppKettle:
             pass
         else:
             print("Unparsed Json message: ", cmd_dict)
-            # unparsed data2/3 status or a message we didn't understand
 
 
 class KettleSocket:
     """Handles connection, encryption and decryption of messages sent by an AppKettle"""
 
-    def __init__(self, sock=None, imei="", broadcast_ip=UDP_IP_BCAST_DEFAULT):
+    def __init__(self, sock=None, imei="", broadcast_ip=UDP_IP_BCAST_DEFAULT, source_ip=None):
         if sock is None:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.settimeout(KETTLE_SOCKET_TIMEOUT_SECS)
@@ -198,6 +199,7 @@ class KettleSocket:
         self.imei = imei
         self.stat = ""
         self.broadcast_ip = broadcast_ip
+        self.source_ip = source_ip
 
     def connect(self, host_port):
         """Attempts to connect to the Kettle"""
@@ -212,36 +214,40 @@ class KettleSocket:
                 self.connected = True
                 return
             except (TimeoutError, OSError) as err:
-                print("Socket error: ", err, " | ", attempts, "attempts remaining")
-                self.kettle_probe()  # run kettle probe to try to wake up the kettle
+                print("Socket error:", err, "|", attempts, "attempts remaining")
+                # optional: try to wake kettle with a short probe
+                self.kettle_probe(attempts=1, timeout=3)
                 attempts -= 1
                 self.connected = False
-
         print("Socket timeout")
         self.connected = False
 
-    def kettle_probe(self):
-        """Sends a UDP 'probe' message to see what the kettle returns.
-        Kettle responds with information about the kettle including the name
+    def kettle_probe(self, attempts=5, timeout=5):
+        """Broadcast probe to discover kettle and return info dict, or None on timeout."""
+        for _ in range(attempts):
+            send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            rcv_sock  = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-        Returns: json string with info about the kettle
-
-        Example probe message: 'Probe#2020-05-05-10-47-15-2'
-        """
-        while True:
-            send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)  # UDP socket
-            rcv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)   # UDP socket
             send_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            send_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            rcv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-            for _i in range(1, 4):
-                # send 3 packets
+            # Bind to specific NIC if requested
+            if self.source_ip:
+                send_sock.bind((self.source_ip, 0))          # ephemeral source port
+                rcv_sock.bind((self.source_ip, UDP_PORT))    # listen on that NIC only
+            else:
+                rcv_sock.bind(("", UDP_PORT))                # all interfaces
+
+            # Send a few probes
+            for _ in range(3):
                 prb = time.strftime("Probe#%Y-%m-%d-%H-%M-%S", time.localtime())
-                send_sock.sendto(str.encode(prb, "ascii"), (self.broadcast_ip, UDP_PORT))
+                send_sock.sendto(prb.encode("ascii"), (self.broadcast_ip, UDP_PORT))
 
             send_sock.close()
             print("Sent broadcast messages, waiting to hear back from kettle...")
-            rcv_sock.bind(("", UDP_PORT))  # listen on all interfaces
-            rcv_sock.settimeout(5)  # 5 sec timeout for this probe
+
+            rcv_sock.settimeout(timeout)
             try:
                 data, address = rcv_sock.recvfrom(1024)
             except socket.timeout:
@@ -251,12 +257,13 @@ class KettleSocket:
             data = data.decode("ascii")
             rcv_sock.close()
 
-            msg = data.split("#")
-            # item 6 has a JSON message with some info
-            msg_json = json.loads(msg[6])
-            msg_json.update({"imei": msg[0]})
-            msg_json.update({"version": msg[3]})
-            msg_json.update({"kettleIP": address[0]})
+            parts = data.split("#")
+            if len(parts) < 7:
+                print("Unexpected probe reply:", data)
+                continue
+
+            msg_json = json.loads(parts[6])
+            msg_json.update({"imei": parts[0], "version": parts[3], "kettleIP": address[0]})
 
             print("Discovered kettle with following parameters:")
             print("- Name:", msg_json.get("AP_ssid"))
@@ -265,30 +272,29 @@ class KettleSocket:
             print("- Wifi SSID:", msg_json.get("devRouter"))
             print("- Software version:", msg_json.get("version"))
             if DEBUG_MSG:
-                print("- Device Status:", msg_json.get("deviceStatus"))  # same format as status msg
+                print("- Device Status:", msg_json.get("deviceStatus"))
 
             self.stat = msg_json
             return msg_json
+
+        print("Discovery timed out: no response after", attempts, "attempts")
+        return None
 
     def keep_connect(self):
         """Sends a ping message to keep connection going"""
         if DEBUG_PRINT_KEEP_CONNECT:
             print("A: KeepConnect")
-
         try:
             self.sock.sendall(MSG_KEEP_CONNECT)
         except OSError as err:
             print("Socket error (keep connect):", err)
             self.connected = False
-            return
 
     def close(self):
-        """Tidy up function to close socket"""
         print("Closing socket...")
         self.sock.close()
 
     def send(self, msg):
-        """Send a message to the kettle using socket.sendall()"""
         try:
             sent = self.sock.sendall(msg)
         except OSError as err:
@@ -300,22 +306,13 @@ class KettleSocket:
             raise RuntimeError("Socket connection broken")
 
     def receive(self):
-        """Called from main event loop, receives a message and then parses it
-
-        Messages are received until '&&' (message terminator), and then parsed
-        """
         chunks = []
         bytes_recd = 0
-        chunk = b""
-        while (
-            bytes_recd < MSGLEN
-            and chunks[-2:] != [b"&", b"&"]
-            and self.connected is True
-        ):
+        while bytes_recd < MSGLEN and chunks[-2:] != [b"&", b"&"] and self.connected:
             try:
                 chunk = self.sock.recv(1)
                 chunks.append(chunk)
-                bytes_recd = bytes_recd + len(chunk)
+                bytes_recd += len(chunk)
             except socket.error:
                 print("Socket connection broken?")
                 self.connected = False
@@ -346,10 +343,6 @@ class KettleSocket:
 
     @staticmethod
     def decrypt(ciphertext):
-        """AES decryption of text received in ciphertext
-
-        Text length needs to be a multiple of 16 bytes
-        """
         try:
             cipher_spec = AES.new(SECRET_KEY, AES.MODE_CBC, SECRET_IV)
             return cipher_spec.decrypt(ciphertext)
@@ -360,32 +353,25 @@ class KettleSocket:
             print("Unexpected error:", sys.exc_info()[0])
             raise
 
-    # pads with 0x00 as this is what the kettle wants rather than some other padding algorithm
     @staticmethod
     def pad(data_to_pad, block):
-        """Pads data with 0x00 to match block size"""
         extra = len(data_to_pad) % block
         if extra > 0:
             return data_to_pad + (b"\x00" * (block - extra))
         return data_to_pad
 
     def encrypt(self, plaintext):
-        """AES encryption of plaintext"""
         try:
             cipher_spec = AES.new(SECRET_KEY, AES.MODE_CBC, SECRET_IV)
             return cipher_spec.encrypt(self.pad(plaintext, AES.block_size))
         except ValueError:
-            print("Not 16-byte boundary data: ", plaintext)
+            print("Not 16-byte boundary data:", plaintext)
             return plaintext
         except Exception:
             print("Unexpected error:", sys.exc_info()[0])
             raise
 
     def send_enc(self, data2, encrypt=False):
-        """Sends a data2 command encoded with header and termination characters
-           Can send Encrypted but can also send plain
-           Note: commands in clear also work
-        """
         msg = '{{"app_cmd":"62","imei":"{imei}","SubDev":"","data2":"{data2}"}}'.format(
             imei=self.imei, data2=data2
         )
@@ -444,7 +430,7 @@ def to_json(myjson):
     return json_object
 
 
-def main_loop(host_port, imei, mqtt_broker, lvl_calib=None, bcast=None):
+def main_loop(host_port, imei, mqtt_broker, lvl_calib=None, bcast=None, src_ip=None):
     """Main event loop called from __main__
 
     Args:
@@ -453,6 +439,7 @@ def main_loop(host_port, imei, mqtt_broker, lvl_calib=None, bcast=None):
         mqtt_broker: array with mqtt broker ip, port, username & password
         lvl_calib: array with the calibration levels for the kettle
         bcast: optional broadcast address
+        src_ip: optional source IP to bind UDP discovery sockets
     """
     # if lvl_calib is empty, use default values; ensure ints
     if not lvl_calib:
@@ -463,12 +450,25 @@ def main_loop(host_port, imei, mqtt_broker, lvl_calib=None, bcast=None):
     broadcast_ip = bcast or UDP_IP_BCAST_DEFAULT
     print("Calibration:", lvl_calib)
     print("Broadcast IP:", broadcast_ip)
+    if src_ip:
+        print("Source IP:", src_ip)
 
-    kettle_socket = KettleSocket(imei=imei, broadcast_ip=broadcast_ip)
+    kettle_socket = KettleSocket(imei=imei or "", broadcast_ip=broadcast_ip, source_ip=src_ip)
     kettle = AppKettle(kettle_socket)
-    kettle_info = kettle_socket.kettle_probe()
-    if kettle_info is not None:
-        kettle.stat.update(kettle_info)
+
+    # Only discover if we’re missing host or IMEI
+    if host_port[0] is None or not imei:
+        kettle_info = kettle_socket.kettle_probe()
+        if kettle_info:
+            if host_port[0] is None:
+                host_port = (kettle_info["kettleIP"], host_port[1])
+            if not imei:
+                imei = kettle_info["imei"]
+                kettle_socket.imei = imei
+            kettle.stat.update(kettle_info)
+        else:
+            print("Discovery failed and no host/IMEI provided. Exiting.")
+            sys.exit(1)
 
     mqttc = None
     if mqtt_broker is not None:
@@ -746,8 +746,16 @@ def argparser():
         metavar="BCAST",
     )
 
+    parser.add_argument(
+        "--src-ip",
+        help="Source IP to bind UDP discovery sockets (choose the interface explicitly)",
+        type=str,
+        default=None,
+        metavar="SRC_IP",
+    )
+
     args = parser.parse_args()
-    main_loop((args.host, args.port), args.imei, args.mqtt, args.calibrate, args.bcast)
+    main_loop((args.host, args.port), args.imei, args.mqtt, args.calibrate, args.bcast, args.src_ip)
 
 
 if __name__ == "__main__":
