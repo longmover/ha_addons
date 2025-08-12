@@ -1,3 +1,6 @@
+## 1.0.6
+- Updated run.sh and main script to add support for custom broadcast address to support multiple HA network interfaces
+
 ## 1.0.5
 - Updated python package names to address install error
 
