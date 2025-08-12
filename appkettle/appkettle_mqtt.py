@@ -3,8 +3,6 @@
 
 usage: appkettle_mqtt.py [-h]
                          [--mqtt host port username password]
-                         [--bcast BCAST]
-                         [--src-ip SRC_IP]
                          [--calibrate lvl_min lvl_max]
                          [--port PORT]
                          [host] [imei]
@@ -17,26 +15,14 @@ optional arguments:
   -h, --help        show this help message and exit
   --mqtt host port username password
                     MQTT broker host, port, username & password (e.g. --mqtt 192.168.0.1 1883 mqtt_user p@55w0Rd)
-  --bcast BCAST     Broadcast address override (default 255.255.255.255)
-  --src-ip SRC_IP   Source IP to bind UDP discovery sockets (choose NIC explicitly)
   --calibrate lvl_min lvl_max
                     Min and max volume values for the kettle water level sensor (e.g. --calibrate 160 1640)
   --port PORT       kettle port (default 6002)
 
-By default both kettle and app talk via the cloud. Blocking internet access to
-the kettle host triggers communication on local network.
-
-To find the IMEI and IP of the kettle run program without parameters.
-
-Pressing Ctrl+C while this program is connected enters a simple debug interface:
-see function cb_signal_handler for available commands.
-
-To log and debug traffic from Android app, install tcpdump on a rooted Android phone:
-- adb shell
-- android:/# tcpdump [host 192.168.0.1] -i wlan0 -s0 -U -w - | nc -k -l -p 11111
-- adb forward tcp:11111 tcp:11111
-- connect this script to localhost:11111. Alternatively,
-    pipe traffic to wireshark (nc localhost 11111 | wireshark -k -S -i -)
+Notes:
+- If you supply a host IP but omit IMEI, the script will unicast-probe that IP to fetch the IMEI.
+- If you supply neither host nor IMEI, the script will attempt broadcast discovery.
+- Be sure to block the kettle’s internet access to force local mode.
 """
 
 import sys
@@ -48,31 +34,28 @@ import json
 import argparse
 from functools import partial
 
-# Make all prints flush immediately (useful under HA/s6 logs)
+# Flush prints so logs show up immediately in HA
 print = partial(print, flush=True)
 
-#import machine
-#import ubinascii
-#from machine import Pin
 import paho.mqtt.client as mqtt     # pip install paho-mqtt
 from Cryptodome.Cipher import AES   # pip install pycryptodomex
 
 from protocol_parser import unpack_msg, calc_msg_checksum
 
 DEBUG_MSG = True
-DEBUG_PRINT_STAT_MSG = False  # print status messages
-DEBUG_PRINT_KEEP_CONNECT = False  # print "keepconnect" packets
-SEND_ENCRYPTED = False  # use AES encrypted comms with kettle
-MSGLEN = 3200  # max msg length: large enough to allow a few msgs to be received
+DEBUG_PRINT_STAT_MSG = False
+DEBUG_PRINT_KEEP_CONNECT = False
+SEND_ENCRYPTED = False
+MSGLEN = 3200
 
 KETTLE_SOCKET_CONNECT_ATTEMPTS = 3
 KETTLE_SOCKET_TIMEOUT_SECS = 60
-KEEP_WARM_MINS = 10  # Default keep warm amount
+KEEP_WARM_MINS = 10
 
 ENCRYPT_HEADER = bytes([0x23, 0x23, 0x38, 0x30])
-PLAIN_HEADER = bytes([0x23, 0x23, 0x30, 0x30])
+PLAIN_HEADER   = bytes([0x23, 0x23, 0x30, 0x30])
 MSG_KEEP_CONNECT = b"##000bKeepConnect&&"
-MSG_KEEP_CONNECT_FREQ_SECS = 30  # sends KeepConnect to keep connection live
+MSG_KEEP_CONNECT_FREQ_SECS = 30
 UDP_IP_BCAST_DEFAULT = "255.255.255.255"
 UDP_PORT = 15103
 
@@ -90,8 +73,7 @@ MQTT_DEVICE_MODEL = "appKettle"
 
 # AES secrets:
 SECRET_KEY = b"ay3$&dw*ndAD!9)<"
-SECRET_IV = b"7e3*WwI(@Dczxcue"
-
+SECRET_IV  = b"7e3*WwI(@Dczxcue"
 
 class AppKettle:
     """Represents a physical appKettle"""
@@ -112,100 +94,75 @@ class AppKettle:
         }
 
     def tick(self):
-        """Increments seq by 1. To be called when sending something to kettle"""
-        self.stat["seq"] = (self.stat["seq"] + 1) % 0xFF  # cap at 1 byte
+        self.stat["seq"] = (self.stat["seq"] + 1) % 0xFF
 
     def turn_on(self, temp=None):
-        """Turns on kettle at a given temperature (temp) and with Keep Warm enabled"""
         if self.stat["status"] != "Ready":
             self.wake()
-
         self.tick()
-
         if temp is None:
             temp = self.stat["set_target_temp"]
-
         msg = "AA001200000000000003B7{seq}39000000{temp}{kw}0000".format(
             temp=("%0.2X" % temp),
             kw=("%0.2X" % (KEEP_WARM_MINS * self.stat["keep_warm_onoff"])),
             seq=("%0.2x" % self.stat["seq"]),
         )
-
         msg = calc_msg_checksum(msg, append=True)
         return self.sock.send_enc(msg, SEND_ENCRYPTED)
 
     def wake(self):
-        """Wake up kettle (status goes to 'Ready') and display comes on"""
         self.tick()
-        msg = "AA000D00000000000003B7{seq}410000".format(
-            seq=("%0.2x" % self.stat["seq"])
-        )
+        msg = "AA000D00000000000003B7{seq}410000".format(seq=("%0.2x" % self.stat["seq"]))
         msg = calc_msg_checksum(msg, append=True)
         return self.sock.send_enc(msg, SEND_ENCRYPTED)
 
     def turn_off(self):
-        """Turn off the kettle"""
         self.tick()
-        msg = "AA000D00000000000003B7{seq}3A0000".format(
-            seq=("%0.2x" % self.stat["seq"])
-        )
+        msg = "AA000D00000000000003B7{seq}3A0000".format(seq=("%0.2x" % self.stat["seq"]))
         msg = calc_msg_checksum(msg, append=True)
         return self.sock.send_enc(msg)
 
     def status_json(self):
-        """Returns JSON message with the key status of the kettle"""
         keys = {"power", "status", "temperature", "target_temp", "volume", "keep_warm_secs"}
         status_dict = {k: self.stat[k] for k in self.stat.keys() & keys}
         return json.dumps(status_dict)
 
     def update_status(self, msg):
-        """Parses a wifi_cmd message to match this class status with the physical kettle"""
         try:
-            cmd_dict = unpack_msg(
-                msg, DEBUG_MSG, DEBUG_PRINT_STAT_MSG, DEBUG_PRINT_KEEP_CONNECT
-            )
+            cmd_dict = unpack_msg(msg, DEBUG_MSG, DEBUG_PRINT_STAT_MSG, DEBUG_PRINT_KEEP_CONNECT)
         except ValueError:
             print("Error in decoding: ", msg)
             return
-
         if not isinstance(cmd_dict, dict):
-            # decoding didn't return anything interesting for us
             return
-
         if "data3" in cmd_dict:
             try:
                 self.stat.update(cmd_dict)
             except ValueError:
                 print("Error in data3 cmd_dict: ", cmd_dict)
-                return
         elif "data2" in cmd_dict:
-            # this means it's a message we sent. Only useful for debugging tcpdump traffic
             pass
         else:
             print("Unparsed Json message: ", cmd_dict)
 
-
 class KettleSocket:
-    """Handles connection, encryption and decryption of messages sent by an AppKettle"""
+    """Handles connection, encryption and decryption for an AppKettle"""
 
-    def __init__(self, sock=None, imei="", broadcast_ip=UDP_IP_BCAST_DEFAULT, source_ip=None):
+    def __init__(self, sock=None, imei="", broadcast_ip=UDP_IP_BCAST_DEFAULT):
         if sock is None:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.settimeout(KETTLE_SOCKET_TIMEOUT_SECS)
         else:
             self.sock = sock
-
         self.connected = False
         self.imei = imei
         self.stat = ""
         self.broadcast_ip = broadcast_ip
-        self.source_ip = source_ip
 
     def connect(self, host_port):
-        """Attempts to connect to the Kettle"""
         attempts = KETTLE_SOCKET_CONNECT_ATTEMPTS
         print("Attempting to connect to socket...")
-        while attempts and self.connected is False:
+        while attempts and not self.connected:
             try:
                 self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 self.sock.settimeout(KETTLE_SOCKET_TIMEOUT_SECS)
@@ -215,73 +172,100 @@ class KettleSocket:
                 return
             except (TimeoutError, OSError) as err:
                 print("Socket error:", err, "|", attempts, "attempts remaining")
-                # optional: try to wake kettle with a short probe
-                self.kettle_probe(attempts=1, timeout=3)
                 attempts -= 1
                 self.connected = False
         print("Socket timeout")
         self.connected = False
 
+    # ---------- Discovery helpers ----------
+    def _parse_probe_reply(self, payload, address):
+        parts = payload.split("#")
+        if len(parts) < 7:
+            print("[DISCOVERY] Unexpected reply format")
+            return None
+        msg_json = json.loads(parts[6])
+        msg_json.update({"imei": parts[0], "version": parts[3], "kettleIP": address[0]})
+        return msg_json
+
+    def kettle_probe_unicast(self, ip, timeout=5):
+        """Send a unicast probe to a known IP and parse reply to get IMEI & info."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("", UDP_PORT))
+        except OSError as e:
+            print(f"[DISCOVERY] bind(UDP {UDP_PORT}) failed:", e)
+            sock.close()
+            return None
+
+        # Required "-2" suffix in probe
+        prb = time.strftime("Probe#%Y-%m-%d-%H-%M-%S-2", time.localtime())
+        print(f"[DISCOVERY] Sending unicast probe to {ip}: {prb}")
+        sock.sendto(prb.encode("ascii"), (ip, UDP_PORT))
+
+        sock.settimeout(timeout)
+        try:
+            data, address = sock.recvfrom(1024)
+        except socket.timeout:
+            print(f"[DISCOVERY] No reply from {ip} within {timeout}s")
+            sock.close()
+            return None
+        payload = data.decode("ascii", errors="replace")
+        print(f"[DISCOVERY] Got reply from {address}: {payload}")
+        sock.close()
+
+        info = self._parse_probe_reply(payload, address)
+        if info:
+            print(f"[DISCOVERY] Unicast success: IP={info.get('kettleIP')} IMEI={info.get('imei')}")
+            self.stat = info
+        return info
+
     def kettle_probe(self, attempts=5, timeout=5):
-        """Broadcast probe to discover kettle and return info dict, or None on timeout."""
-        for _ in range(attempts):
-            send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            rcv_sock  = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
-            send_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            send_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            rcv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-            # Bind to specific NIC if requested
-            if self.source_ip:
-                send_sock.bind((self.source_ip, 0))          # ephemeral source port
-                rcv_sock.bind((self.source_ip, UDP_PORT))    # listen on that NIC only
-            else:
-                rcv_sock.bind(("", UDP_PORT))                # all interfaces
-
-            # Send a few probes
-            for _ in range(3):
-                prb = time.strftime("Probe#%Y-%m-%d-%H-%M-%S", time.localtime())
-                send_sock.sendto(prb.encode("ascii"), (self.broadcast_ip, UDP_PORT))
-
-            send_sock.close()
-            print("Sent broadcast messages, waiting to hear back from kettle...")
-
-            rcv_sock.settimeout(timeout)
+        """Broadcast probe (L2) to discover kettle and return info dict."""
+        for attempt in range(1, attempts + 1):
             try:
-                data, address = rcv_sock.recvfrom(1024)
-            except socket.timeout:
-                rcv_sock.close()
-                continue
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                try:
+                    sock.bind(("", UDP_PORT))  # single socket for send/recv
+                except OSError as e:
+                    print(f"[DISCOVERY] bind(UDP {UDP_PORT}) failed:", e)
+                    sock.close()
+                    break
 
-            data = data.decode("ascii")
-            rcv_sock.close()
+                print(f"[DISCOVERY] Broadcast attempt {attempt}/{attempts} bcast={self.broadcast_ip}")
+                # Send several probes with "-2" suffix
+                for _ in range(4):
+                    prb = time.strftime("Probe#%Y-%m-%d-%H-%M-%S-2", time.localtime())
+                    sock.sendto(prb.encode("ascii"), (self.broadcast_ip, UDP_PORT))
+                    print(f"[DISCOVERY] Sent probe: {prb}")
 
-            parts = data.split("#")
-            if len(parts) < 7:
-                print("Unexpected probe reply:", data)
-                continue
+                sock.settimeout(timeout)
+                try:
+                    data, address = sock.recvfrom(1024)
+                except socket.timeout:
+                    print(f"[DISCOVERY] Timeout after {timeout}s waiting for reply")
+                    sock.close()
+                    continue
 
-            msg_json = json.loads(parts[6])
-            msg_json.update({"imei": parts[0], "version": parts[3], "kettleIP": address[0]})
+                payload = data.decode("ascii", errors="replace")
+                print(f"[DISCOVERY] Got reply from {address}: {payload}")
+                sock.close()
 
-            print("Discovered kettle with following parameters:")
-            print("- Name:", msg_json.get("AP_ssid"))
-            print("- IP:", msg_json.get("kettleIP"))
-            print("- IMEI:", msg_json.get("imei"))
-            print("- Wifi SSID:", msg_json.get("devRouter"))
-            print("- Software version:", msg_json.get("version"))
-            if DEBUG_MSG:
-                print("- Device Status:", msg_json.get("deviceStatus"))
+                info = self._parse_probe_reply(payload, address)
+                if info:
+                    print("[DISCOVERY] Broadcast success")
+                    self.stat = info
+                    return info
+            except Exception as e:
+                print(f"[DISCOVERY] Broadcast error: {e}")
 
-            self.stat = msg_json
-            return msg_json
-
-        print("Discovery timed out: no response after", attempts, "attempts")
+        print(f"[DISCOVERY] No response after {attempts} attempts")
         return None
+    # ---------- end discovery helpers ----------
 
     def keep_connect(self):
-        """Sends a ping message to keep connection going"""
         if DEBUG_PRINT_KEEP_CONNECT:
             print("A: KeepConnect")
         try:
@@ -322,7 +306,6 @@ class KettleSocket:
                 self.connected = False
                 return None
 
-        # filter out anything before b"##" (e.g. TCP packet headers)
         frame = b"".join(chunks).partition(b"##")
         frame = frame[1] + frame[2]
 
@@ -386,18 +369,13 @@ class KettleSocket:
         if DEBUG_MSG:
             unpack_msg(to_json(msg))
 
-
 def cb_mqtt_on_connect(client, kettle, flags, rec_code):
-    """The callback for when the client receives a CONNACK response from the server."""
     print("Connected to MQTT broker with result code " + str(rec_code))
-    client.subscribe(MQTT_COMMAND_TOPIC + "/#")  # subscribe to all topics
-
+    client.subscribe(MQTT_COMMAND_TOPIC + "/#")
 
 def cb_mqtt_on_message(mqttc, kettle, msg):
-    """The callback for when a PUBLISH message is received from the server."""
     print("MQTT MSG: " + msg.topic + " : " + str(msg.payload))
-    kettle.wake()  # wake up kettle when receiving a command
-
+    kettle.wake()
     if msg.topic == MQTT_COMMAND_TOPIC + "/power":
         if msg.payload == b"ON":
             kettle.turn_on()
@@ -406,7 +384,6 @@ def cb_mqtt_on_message(mqttc, kettle, msg):
         else:
             print("MQTT MSG: msg not recognised:", msg)
         mqttc.publish(MQTT_STATUS_TOPIC + "/power", kettle.stat["power"])
-
     elif msg.topic == MQTT_COMMAND_TOPIC + "/keep_warm_onoff":
         if msg.payload == b"True":
             kettle.stat["keep_warm_onoff"] = True
@@ -415,60 +392,53 @@ def cb_mqtt_on_message(mqttc, kettle, msg):
         else:
             print("MQTT MSG: msg not recognised:", msg)
         mqttc.publish(MQTT_STATUS_TOPIC + "/keep_warm_onoff", kettle.stat["keep_warm_onoff"])
-
     elif msg.topic == MQTT_COMMAND_TOPIC + "/set_target_temp":
         kettle.stat["set_target_temp"] = int(msg.payload)
         mqttc.publish(MQTT_STATUS_TOPIC + "/set_target_temp", kettle.stat["set_target_temp"])
 
-
 def to_json(myjson):
-    """Helper: if it is JSON returns JSON, otherwise returns original string"""
     try:
         json_object = json.loads(myjson)
     except (ValueError, TypeError):
         return myjson
     return json_object
 
-
-def main_loop(host_port, imei, mqtt_broker, lvl_calib=None, bcast=None, src_ip=None):
-    """Main event loop called from __main__
-
-    Args:
-        host_port: tuple with the kettle host and port
-        imei: kettle IMEI
-        mqtt_broker: array with mqtt broker ip, port, username & password
-        lvl_calib: array with the calibration levels for the kettle
-        bcast: optional broadcast address
-        src_ip: optional source IP to bind UDP discovery sockets
-    """
-    # if lvl_calib is empty, use default values; ensure ints
+def main_loop(host_port, imei, mqtt_broker, lvl_calib=None):
+    """Main event loop called from __main__"""
+    # calibration defaults
     if not lvl_calib:
         lvl_calib = [160, 1640]
     else:
         lvl_calib = [int(lvl_calib[0]), int(lvl_calib[1])]
-
-    broadcast_ip = bcast or UDP_IP_BCAST_DEFAULT
     print("Calibration:", lvl_calib)
-    print("Broadcast IP:", broadcast_ip)
-    if src_ip:
-        print("Source IP:", src_ip)
 
-    kettle_socket = KettleSocket(imei=imei or "", broadcast_ip=broadcast_ip, source_ip=src_ip)
+    kettle_socket = KettleSocket(imei=imei or "")
     kettle = AppKettle(kettle_socket)
 
-    # Only discover if we’re missing host or IMEI
-    if host_port[0] is None or not imei:
-        kettle_info = kettle_socket.kettle_probe()
-        if kettle_info:
-            if host_port[0] is None:
-                host_port = (kettle_info["kettleIP"], host_port[1])
-            if not imei:
-                imei = kettle_info["imei"]
-                kettle_socket.imei = imei
-            kettle.stat.update(kettle_info)
-        else:
-            print("Discovery failed and no host/IMEI provided. Exiting.")
+    # Discovery rules:
+    # - If host provided but imei missing: unicast probe that host to fetch IMEI/info
+    # - If neither provided: broadcast discovery
+    if host_port[0] and not imei:
+        print("[DISCOVERY] Known host provided, discovering IMEI via unicast…")
+        info = kettle_socket.kettle_probe_unicast(host_port[0])
+        if not info:
+            print("Discovery (unicast) failed. Exiting.")
             sys.exit(1)
+        imei = info["imei"]
+        kettle_socket.imei = imei
+        kettle.stat.update(info)
+    elif not host_port[0]:
+        print("[DISCOVERY] No host provided, attempting broadcast discovery…")
+        info = kettle_socket.kettle_probe()
+        if not info:
+            print("Discovery (broadcast) failed and no host provided. Exiting.")
+            sys.exit(1)
+        host_port = (info["kettleIP"], host_port[1])
+        imei = info["imei"]
+        kettle_socket.imei = imei
+        kettle.stat.update(info)
+    else:
+        print("[DISCOVERY] Host and IMEI provided; skipping discovery.")
 
     mqttc = None
     if mqtt_broker is not None:
@@ -477,13 +447,12 @@ def main_loop(host_port, imei, mqtt_broker, lvl_calib=None, bcast=None, src_ip=N
             mqttc.username_pw_set(mqtt_broker[2], password=mqtt_broker[3])
         mqttc.on_connect = cb_mqtt_on_connect
         mqttc.on_message = cb_mqtt_on_message
-        # passes to each callback $kettle as $userdata
         mqttc.user_data_set(kettle)
         mqttc.will_set(MQTT_AVAILABILITY_TOPIC, "offline", retain=True)
         mqttc.connect(mqtt_broker[0], int(mqtt_broker[1]))
         mqttc.publish(MQTT_AVAILABILITY_TOPIC, "online", retain=True)
 
-        # publish HA discovery topics
+        # Home Assistant discovery entities
         mqttc.publish(
             MQTT_SWITCH_DISC_TOPIC + "/power/config",
             json.dumps({
@@ -620,18 +589,14 @@ def main_loop(host_port, imei, mqtt_broker, lvl_calib=None, bcast=None, src_ip=N
         mqttc.loop_start()
 
     def cb_signal_handler(sig, frame):
-        """Handles Ctrl+C signal. Useful for debugging and testing the protocol"""
         user_input = input("prompt|>> ")
         if user_input == "q":
             kettle.sock.close()
             sys.exit(0)
             return
-
         if user_input == "":
             return
-
         params = user_input.split()
-
         if user_input[:2] == "on":
             if len(params) == 1:
                 kettle.turn_on()
@@ -648,10 +613,8 @@ def main_loop(host_port, imei, mqtt_broker, lvl_calib=None, bcast=None, src_ip=N
         elif user_input[:3] == "k":
             kettle_socket.keep_connect()
         elif user_input[:3] == "sl:":
-            # send literal - for debug (this is the entire ##0080{...}&& msg)
             kettle.sock.send(bytes(user_input[3:].encode()))
         elif user_input[:3] == "sm:":
-            # send message - for debug (this is the data2 string)
             kettle.sock.send_enc(user_input[3:], SEND_ENCRYPTED)
         else:
             print("Input not recognised:", user_input)
@@ -705,58 +668,31 @@ def main_loop(host_port, imei, mqtt_broker, lvl_calib=None, bcast=None, src_ip=N
                     if i in kettle.stat:
                         mqttc.publish(MQTT_STATUS_TOPIC + "/" + i, kettle.stat[i])
 
-        if len(outfds) != 0:
-            pass
-        if len(errfds) != 0:
-            pass
-
         if time.time() - timestamp > MSG_KEEP_CONNECT_FREQ_SECS:
             kettle_socket.keep_connect()
             timestamp = time.time()
 
-        time.sleep(0.2)  # build-in a little sleep
-
+        time.sleep(0.2)
 
 def argparser():
-    """Parses input arguments, see -h"""
     parser = argparse.ArgumentParser()
     parser.add_argument("host", nargs="?", help="kettle host or IP")
     parser.add_argument("imei", nargs="?", help="kettle IMEI (e.g. GD0-12300-35aa)")
     parser.add_argument("--port", help="kettle port (default 6002)", default=6002, type=int)
-
     parser.add_argument(
         "--mqtt",
         help="MQTT broker host, port, username & password (e.g. --mqtt 192.168.0.1 1883 mqtt_user p@55w0Rd)",
         nargs=4,
         metavar=("host", "port", "username", "password"),
     )
-
     parser.add_argument(
         "--calibrate",
         help="Min and max volume values for the kettle water level sensor (e.g. --calibrate 160 1640)",
         nargs=2,
         metavar=("lvl_min", "lvl_max"),
     )
-
-    parser.add_argument(
-        "--bcast",
-        help="Broadcast address for the subnet, defaults to 255.255.255.255 if not set",
-        type=str,
-        default=None,
-        metavar="BCAST",
-    )
-
-    parser.add_argument(
-        "--src-ip",
-        help="Source IP to bind UDP discovery sockets (choose the interface explicitly)",
-        type=str,
-        default=None,
-        metavar="SRC_IP",
-    )
-
     args = parser.parse_args()
-    main_loop((args.host, args.port), args.imei, args.mqtt, args.calibrate, args.bcast, args.src_ip)
-
+    main_loop((args.host, args.port), args.imei, args.mqtt, args.calibrate)
 
 if __name__ == "__main__":
     argparser()
