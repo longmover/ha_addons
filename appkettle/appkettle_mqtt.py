@@ -128,22 +128,44 @@ class AppKettle:
         return json.dumps(status_dict)
 
     def update_status(self, msg):
+        """Parses a wifi_cmd message to match this class status with the physical kettle"""
         try:
-            cmd_dict = unpack_msg(msg, DEBUG_MSG, DEBUG_PRINT_STAT_MSG, DEBUG_PRINT_KEEP_CONNECT)
+            cmd_dict = unpack_msg(
+                msg, DEBUG_MSG, DEBUG_PRINT_STAT_MSG, DEBUG_PRINT_KEEP_CONNECT
+            )
         except ValueError:
             print("Error in decoding: ", msg)
             return
+    
         if not isinstance(cmd_dict, dict):
+            # nothing useful
             return
-        if "data3" in cmd_dict:
-            try:
-                self.stat.update(cmd_dict)
-            except ValueError:
-                print("Error in data3 cmd_dict: ", cmd_dict)
-        elif "data2" in cmd_dict:
-            pass
-        else:
-            print("Unparsed Json message: ", cmd_dict)
+    
+        # If unpack_msg already gave us flattened status keys, merge them
+        # (typical keys seen: cmd, status, temperature, target_temp, volume, power, keep_warm_secs, etc.)
+        known_keys = {
+            "cmd", "status", "temperature", "target_temp", "set_target_temp",
+            "volume", "power", "keep_warm_secs", "keep_warm_onoff", "version"
+        }
+        if known_keys & cmd_dict.keys():
+            for k in known_keys:
+                if k in cmd_dict:
+                    self.stat[k] = cmd_dict[k]
+            return
+    
+        # Legacy path: some decoders nest under data3 (keep for compatibility)
+        if "data3" in cmd_dict and isinstance(cmd_dict["data3"], dict):
+            for k in known_keys:
+                if k in cmd_dict["data3"]:
+                    self.stat[k] = cmd_dict["data3"][k]
+            return
+    
+        # Messages we sent (debug traffic) or other frames we don't care about
+        if "data2" in cmd_dict:
+            return
+    
+        print("Unparsed Json message: ", cmd_dict)
+  
 
 class KettleSocket:
     """Handles connection, encryption and decryption for an AppKettle"""
