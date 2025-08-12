@@ -14,10 +14,11 @@ mqtt_usr=$(bashio::config 'mqtt_usr')
 mqtt_pwd=$(bashio::config 'mqtt_pwd')
 min_lvl=$(bashio::config 'min_lvl')
 max_lvl=$(bashio::config 'max_lvl')
+bcast=$(bashio::config 'bcast')
 
 if [ -z $kettle_ip ]
 then
   echo "No kettle detected, ensure kettle cannot access the internet and retry"
 else
-  python3 /appkettle_mqtt.py --mqtt $mqtt_host $mqtt_port $mqtt_usr $mqtt_pwd $kettle_ip $kettle_imei --calibrate $min_lvl $max_lvl
+  python3 /appkettle_mqtt.py --mqtt $mqtt_host $mqtt_port $mqtt_usr $mqtt_pwd $kettle_ip $kettle_imei --calibrate $min_lvl $max_lvl --bcast $bcast
 fi
