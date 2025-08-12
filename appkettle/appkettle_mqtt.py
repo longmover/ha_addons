@@ -1,7 +1,7 @@
 #! /usr/bin/python3
 """Provides a running daemon for interfacing with an appKettle
 
-usage: appkettle_mqtt.py [-h] [--mqtt host port username password] [host] [imei]
+usage: appkettle_mqtt.py [-h] [--mqtt host port username password] [--bcast BCAST] [--calibrate lvl_min lvl_max] [--port PORT] [host] [imei]
 
 arguments:
   host              kettle host or IP
@@ -9,7 +9,12 @@ arguments:
 
 optional arguments:
   -h, --help        show this help message and exit
-  --mqtt host port  MQTT broker host, port, username & password (e.g. --mqtt 192.168.0.1 1883 mqtt_user p@55w0Rd)
+  --mqtt host port username password
+                    MQTT broker host, port, username & password (e.g. --mqtt 192.168.0.1 1883 mqtt_user p@55w0Rd)
+  --bcast BCAST     Broadcast address for the subnet, defaults to 255.255.255.255 if not set
+  --calibrate lvl_min lvl_max
+                    Min and max volume values for the kettle water level sensor (e.g. --calibrate 160 1640)
+  --port PORT       kettle port (default 6002)
 
 By default the both kettle and app talk via the cloud. Blocking internet access to
 the kettle host triggers communication on local network
@@ -37,7 +42,7 @@ import argparse
 #import machine
 #import ubinascii
 #from machine import Pin
-import paho.mqtt.client as mqtt     # pip install paho.mqtt
+import paho.mqtt.client as mqtt     # pip install paho-mqtt
 from Cryptodome.Cipher import AES   # pip install pycryptodomex
 
 from protocol_parser import unpack_msg, calc_msg_checksum
@@ -55,10 +60,8 @@ KEEP_WARM_MINS = 10  # Default keep warm amount
 ENCRYPT_HEADER = bytes([0x23, 0x23, 0x38, 0x30])
 PLAIN_HEADER = bytes([0x23, 0x23, 0x30, 0x30])
 MSG_KEEP_CONNECT = b"##000bKeepConnect&&"
-MSG_KEEP_CONNECT_FREQ_SECS = (
-    30  # sends a KeepConnect to keep connection live (e.g. app open)
-)
-UDP_IP_BCAST = "255.255.255.255"
+MSG_KEEP_CONNECT_FREQ_SECS = 30  # sends a KeepConnect to keep connection live (e.g. app open)
+UDP_IP_BCAST_DEFAULT = "255.255.255.255"
 UDP_PORT = 15103
 
 MQTT_BASE = "appKettle/"
@@ -79,7 +82,7 @@ SECRET_IV = b"7e3*WwI(@Dczxcue"
 
 
 class AppKettle:
-    """Represents a phisical appKettle"""
+    """Represents a physical appKettle"""
 
     def __init__(self, sock=None):
         self.sock = sock
@@ -120,7 +123,7 @@ class AppKettle:
         return self.sock.send_enc(msg, SEND_ENCRYPTED)
 
     def wake(self):
-        """Wake up kettle (status goes to "Ready") and display comes on"""
+        """Wake up kettle (status goes to 'Ready') and display comes on"""
         self.tick()
         msg = "AA000D00000000000003B7{seq}410000".format(
             seq=("%0.2x" % self.stat["seq"])
@@ -154,26 +157,26 @@ class AppKettle:
         return json.dumps(status_dict)
 
     def update_status(self, msg):
-        """Parses a wifi_cmd message to match this class status with the phisical kettle"""
+        """Parses a wifi_cmd message to match this class status with the physical kettle"""
         try:
             cmd_dict = unpack_msg(
                 msg, DEBUG_MSG, DEBUG_PRINT_STAT_MSG, DEBUG_PRINT_KEEP_CONNECT
             )
         except ValueError:
-            print("Error in decoding: ", cmd_dict)
+            print("Error in decoding: ", msg)
             return
 
-        if isinstance(msg, (str, bytes, type(None))):
+        if not isinstance(cmd_dict, dict):
             # decoding didn't return anything interesting for us
             return
 
-        if "data3" in msg:
+        if "data3" in cmd_dict:
             try:
                 self.stat.update(cmd_dict)
             except ValueError:
                 print("Error in data3 cmd_dict: ", cmd_dict)
                 return
-        elif "data2" in msg:
+        elif "data2" in cmd_dict:
             # this means it's a message we sent. Only useful for debugging tcpdump traffic
             pass
         else:
@@ -182,11 +185,9 @@ class AppKettle:
 
 
 class KettleSocket:
-    """ This class deals with the connection, encryption and decryption
-        of messages sent by an AppKettle
-    """
+    """Handles connection, encryption and decryption of messages sent by an AppKettle"""
 
-    def __init__(self, sock=None, imei=""):
+    def __init__(self, sock=None, imei="", broadcast_ip=UDP_IP_BCAST_DEFAULT):
         if sock is None:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.settimeout(KETTLE_SOCKET_TIMEOUT_SECS)
@@ -196,9 +197,10 @@ class KettleSocket:
         self.connected = False
         self.imei = imei
         self.stat = ""
+        self.broadcast_ip = broadcast_ip
 
     def connect(self, host_port):
-        """ Attempts to connect to the Kettle """
+        """Attempts to connect to the Kettle"""
         attempts = KETTLE_SOCKET_CONNECT_ATTEMPTS
         print("Attempting to connect to socket...")
         while attempts and self.connected is False:
@@ -210,8 +212,7 @@ class KettleSocket:
                 self.connected = True
                 return
             except (TimeoutError, OSError) as err:
-                print("Socket error: ", err, " | ",
-                      attempts, "attempts remaining")
+                print("Socket error: ", err, " | ", attempts, "attempts remaining")
                 self.kettle_probe()  # run kettle probe to try to wake up the kettle
                 attempts -= 1
                 self.connected = False
@@ -220,31 +221,26 @@ class KettleSocket:
         self.connected = False
 
     def kettle_probe(self):
-        """Sends a UDP "probe" message to see what the kettle returns.
+        """Sends a UDP 'probe' message to see what the kettle returns.
         Kettle responds with information about the kettle including the name
 
         Returns: json string with info about the kettle
 
-        Example probe message: "Probe#2020-05-05-10-47-15-2"
+        Example probe message: 'Probe#2020-05-05-10-47-15-2'
         """
-
         while True:
-            send_sock = socket.socket(
-                socket.AF_INET, socket.SOCK_DGRAM)  # UDP socket
-            rcv_sock = socket.socket(
-                socket.AF_INET, socket.SOCK_DGRAM)  # UDP socket
+            send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)  # UDP socket
+            rcv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)   # UDP socket
             send_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
             for _i in range(1, 4):
-                # send 4 packets
-                prb = time.strftime(
-                    "Probe#%Y-%m-%d-%H-%M-%S", time.localtime())
-                send_sock.sendto(str.encode(prb, "ascii"),
-                                 (UDP_IP_BCAST, UDP_PORT))
+                # send 3 packets
+                prb = time.strftime("Probe#%Y-%m-%d-%H-%M-%S", time.localtime())
+                send_sock.sendto(str.encode(prb, "ascii"), (self.broadcast_ip, UDP_PORT))
 
             send_sock.close()
             print("Sent broadcast messages, waiting to hear back from kettle...")
-            rcv_sock.bind(("", UDP_PORT))  # listen on all ports
+            rcv_sock.bind(("", UDP_PORT))  # listen on all interfaces
             rcv_sock.settimeout(5)  # 5 sec timeout for this probe
             try:
                 data, address = rcv_sock.recvfrom(1024)
@@ -263,21 +259,19 @@ class KettleSocket:
             msg_json.update({"kettleIP": address[0]})
 
             print("Discovered kettle with following parameters:")
-            print("- Name:", msg_json["AP_ssid"])
-            print("- IP:", msg_json["kettleIP"])
-            print("- IMEI:", msg_json["imei"])
-            print("- Wifi SSID:", msg_json["devRouter"])
-            print("- Software version:", msg_json["version"])
+            print("- Name:", msg_json.get("AP_ssid"))
+            print("- IP:", msg_json.get("kettleIP"))
+            print("- IMEI:", msg_json.get("imei"))
+            print("- Wifi SSID:", msg_json.get("devRouter"))
+            print("- Software version:", msg_json.get("version"))
             if DEBUG_MSG:
-                print(
-                    "- Device Status:", msg_json["deviceStatus"]
-                )  # same format as status msg
+                print("- Device Status:", msg_json.get("deviceStatus"))  # same format as status msg
 
             self.stat = msg_json
             return msg_json
 
     def keep_connect(self):
-        """ Sends a ping message to keep connection going """
+        """Sends a ping message to keep connection going"""
         if DEBUG_PRINT_KEEP_CONNECT:
             print("A: KeepConnect")
 
@@ -289,12 +283,12 @@ class KettleSocket:
             return
 
     def close(self):
-        """ Tidy up function to close scoket """
+        """Tidy up function to close socket"""
         print("Closing socket...")
         self.sock.close()
 
     def send(self, msg):
-        """ Send a message to the kettle using socket.sendall() """
+        """Send a message to the kettle using socket.sendall()"""
         try:
             sent = self.sock.sendall(msg)
         except OSError as err:
@@ -306,7 +300,7 @@ class KettleSocket:
             raise RuntimeError("Socket connection broken")
 
     def receive(self):
-        """ Called back from main event loop, receives a message and then parses it
+        """Called from main event loop, receives a message and then parses it
 
         Messages are received until '&&' (message terminator), and then parsed
         """
@@ -323,7 +317,7 @@ class KettleSocket:
                 chunks.append(chunk)
                 bytes_recd = bytes_recd + len(chunk)
             except socket.error:
-                print("Socket connection broken?",)
+                print("Socket connection broken?")
                 self.connected = False
                 return None
             if chunk == b"":
@@ -331,8 +325,7 @@ class KettleSocket:
                 self.connected = False
                 return None
 
-        # this is necessary so it works also when streaming tcpdump traffic,
-        # it filters out anything before b"##" (e.g. TCP packet headers)
+        # filter out anything before b"##" (e.g. TCP packet headers)
         frame = b"".join(chunks).partition(b"##")
         frame = frame[1] + frame[2]
 
@@ -353,9 +346,9 @@ class KettleSocket:
 
     @staticmethod
     def decrypt(ciphertext):
-        """ AES decryption of text received in ciphertext
+        """AES decryption of text received in ciphertext
 
-        Text lenght needs to be a multiple of 16 bytes
+        Text length needs to be a multiple of 16 bytes
         """
         try:
             cipher_spec = AES.new(SECRET_KEY, AES.MODE_CBC, SECRET_IV)
@@ -363,35 +356,35 @@ class KettleSocket:
         except ValueError:
             print("Not 16-byte boundary data")
             return ciphertext
-        except:
+        except Exception:
             print("Unexpected error:", sys.exc_info()[0])
             raise
 
     # pads with 0x00 as this is what the kettle wants rather than some other padding algorithm
     @staticmethod
     def pad(data_to_pad, block):
-        """ Pads data with 0x00 to match block size """
+        """Pads data with 0x00 to match block size"""
         extra = len(data_to_pad) % block
         if extra > 0:
             return data_to_pad + (b"\x00" * (block - extra))
         return data_to_pad
 
     def encrypt(self, plaintext):
-        """ AES encryption of plaintext """
+        """AES encryption of plaintext"""
         try:
             cipher_spec = AES.new(SECRET_KEY, AES.MODE_CBC, SECRET_IV)
             return cipher_spec.encrypt(self.pad(plaintext, AES.block_size))
         except ValueError:
             print("Not 16-byte boundary data: ", plaintext)
             return plaintext
-        except:
+        except Exception:
             print("Unexpected error:", sys.exc_info()[0])
             raise
 
     def send_enc(self, data2, encrypt=False):
-        """ Sends a data2 command encoded with header and termination characters
-            Can send Encrypted but can also send plain
-            Note: commands in clear also work
+        """Sends a data2 command encoded with header and termination characters
+           Can send Encrypted but can also send plain
+           Note: commands in clear also work
         """
         msg = '{{"app_cmd":"62","imei":"{imei}","SubDev":"","data2":"{data2}"}}'.format(
             imei=self.imei, data2=data2
@@ -402,24 +395,20 @@ class KettleSocket:
         else:
             content = msg.encode()
             header = PLAIN_HEADER
-        encoded_msg = header + bytes("%0.2X" %
-                                     len(content), "utf-8") + content + b"&&"
+        encoded_msg = header + bytes("%0.2X" % len(content), "utf-8") + content + b"&&"
         self.send(encoded_msg)
         if DEBUG_MSG:
             unpack_msg(to_json(msg))
 
 
 def cb_mqtt_on_connect(client, kettle, flags, rec_code):
-    """ The callback for when the client receives a CONNACK response from the server. """
+    """The callback for when the client receives a CONNACK response from the server."""
     print("Connected to MQTT broker with result code " + str(rec_code))
-
-    # Subscribing in on_connect() means that if we lose the connection and
-    # reconnect then subscriptions will be renewed.
     client.subscribe(MQTT_COMMAND_TOPIC + "/#")  # subscribe to all topics
 
 
 def cb_mqtt_on_message(mqttc, kettle, msg):
-    """ The callback for when a PUBLISH message is received from the server. """
+    """The callback for when a PUBLISH message is received from the server."""
     print("MQTT MSG: " + msg.topic + " : " + str(msg.payload))
     kettle.wake()  # wake up kettle when receiving a command
 
@@ -439,21 +428,15 @@ def cb_mqtt_on_message(mqttc, kettle, msg):
             kettle.stat["keep_warm_onoff"] = False
         else:
             print("MQTT MSG: msg not recognised:", msg)
-        mqttc.publish(
-            MQTT_STATUS_TOPIC +
-            "/keep_warm_onoff", kettle.stat["keep_warm_onoff"]
-        )
+        mqttc.publish(MQTT_STATUS_TOPIC + "/keep_warm_onoff", kettle.stat["keep_warm_onoff"])
 
     elif msg.topic == MQTT_COMMAND_TOPIC + "/set_target_temp":
         kettle.stat["set_target_temp"] = int(msg.payload)
-        mqttc.publish(
-            MQTT_STATUS_TOPIC +
-            "/set_target_temp", kettle.stat["set_target_temp"]
-        )
+        mqttc.publish(MQTT_STATUS_TOPIC + "/set_target_temp", kettle.stat["set_target_temp"])
 
 
 def to_json(myjson):
-    """ Helper function: if it is Json returns Json otherwise returns original string """
+    """Helper: if it is JSON returns JSON, otherwise returns original string"""
     try:
         json_object = json.loads(myjson)
     except (ValueError, TypeError):
@@ -461,181 +444,178 @@ def to_json(myjson):
     return json_object
 
 
-def main_loop(host_port, imei, mqtt_broker, lvl_calib):
-    """ Main event loop called from __main__
+def main_loop(host_port, imei, mqtt_broker, lvl_calib=None, bcast=None):
+    """Main event loop called from __main__
 
     Args:
         host_port: tuple with the kettle host and port
         imei: kettle IMEI
         mqtt_broker: array with mqtt broker ip, port, username & password
         lvl_calib: array with the calibration levels for the kettle
+        bcast: optional broadcast address
     """
-    # if lvl_calib is empty, use default values
+    # if lvl_calib is empty, use default values; ensure ints
     if not lvl_calib:
         lvl_calib = [160, 1640]
+    else:
+        lvl_calib = [int(lvl_calib[0]), int(lvl_calib[1])]
 
-    print(lvl_calib)
+    broadcast_ip = bcast or UDP_IP_BCAST_DEFAULT
+    print("Calibration:", lvl_calib)
+    print("Broadcast IP:", broadcast_ip)
 
-    kettle_socket = KettleSocket(imei=imei)
+    kettle_socket = KettleSocket(imei=imei, broadcast_ip=broadcast_ip)
     kettle = AppKettle(kettle_socket)
     kettle_info = kettle_socket.kettle_probe()
     if kettle_info is not None:
         kettle.stat.update(kettle_info)
 
-    if not mqtt_broker is None:
+    mqttc = None
+    if mqtt_broker is not None:
         mqttc = mqtt.Client()
-        if not mqtt_broker[2] is None:
+        if mqtt_broker[2] is not None:
             mqttc.username_pw_set(mqtt_broker[2], password=mqtt_broker[3])
         mqttc.on_connect = cb_mqtt_on_connect
         mqttc.on_message = cb_mqtt_on_message
         # passes to each callback $kettle as $userdata
         mqttc.user_data_set(kettle)
-        mqttc.will_set(MQTT_AVAILABILITY_TOPIC,
-                       "offline", retain=True)
+        mqttc.will_set(MQTT_AVAILABILITY_TOPIC, "offline", retain=True)
         mqttc.connect(mqtt_broker[0], int(mqtt_broker[1]))
         mqttc.publish(MQTT_AVAILABILITY_TOPIC, "online", retain=True)
-        
-        # publish HA discovery topics
-        mqttc.publish(MQTT_SWITCH_DISC_TOPIC + "/power/config",
-                      json.dumps({
-                          "availability": [
-                              {
-                                  "topic": MQTT_AVAILABILITY_TOPIC
-                              }
-                          ],
-                          "command_topic": MQTT_COMMAND_TOPIC + "/power",
-                          "device": {
-                              "identifiers": MQTT_DEVICE_NAME,
-                              "manufacturer": MQTT_DEVICE_MANUFACTURER,
-                              "model": MQTT_DEVICE_MODEL,
-                              "name": MQTT_DEVICE_NAME
-                          },
-                          "name": "Kettle Power",
-                          "state_topic": MQTT_STATUS_TOPIC + "/power",
-                          "unique_id": "kettle_power",
-                          "payload_on": "ON",
-                          "payload_off": "OFF",
-                          "icon": "mdi:kettle"
-                      }), retain=True)
-        mqttc.publish(MQTT_SWITCH_DISC_TOPIC + "/keep_warm_onoff/config",
-                      json.dumps({
-                          "availability": [
-                              {
-                                  "topic": MQTT_AVAILABILITY_TOPIC
 
-                              }
-                          ],
-                          "device": {
-                              "identifiers": MQTT_DEVICE_NAME,
-                              "manufacturer": MQTT_DEVICE_MANUFACTURER,
-                              "model": MQTT_DEVICE_MODEL,
-                              "name": MQTT_DEVICE_NAME
-                          },
-                          "name": "Kettle Keep Warm",
-                          "state_topic": MQTT_STATUS_TOPIC + "/keep_warm_onoff",
-                          "command_topic": MQTT_COMMAND_TOPIC + "/keep_warm_onoff",
-                          "unique_id": "kettle_keep_warm",
-                          "payload_on": "True",
-                          "payload_off": "False",
-                          "icon": "mdi:kettle-steam"
-                      }), retain=True)
-        mqttc.publish(MQTT_NUMBER_DISC_TOPIC + "/set_target_temp/config",
-                      json.dumps({
-                          "availability": [
-                              {
-                                  "topic": MQTT_AVAILABILITY_TOPIC
-                              }
-                          ],
-                          "device": {
-                              "identifiers": MQTT_DEVICE_NAME,
-                              "manufacturer": MQTT_DEVICE_MANUFACTURER,
-                              "model": MQTT_DEVICE_MODEL,
-                              "name": MQTT_DEVICE_NAME
-                          },
-                          "name": "Kettle Target Temperature",
-                          "state_topic": MQTT_STATUS_TOPIC + "/set_target_temp",
-                          "command_topic": MQTT_COMMAND_TOPIC + "/set_target_temp",
-                          "unique_id": "kettle_target_temp",
-                          "unit_of_measurement": "C",
-                          "icon": "mdi:thermometer-check",
-                          "max": 100,
-                          "min": 30
-                      }), retain=True)
-        mqttc.publish(MQTT_SENSOR_DISC_TOPIC + "/current_temp/config",
-                      json.dumps({
-                          "availability": [
-                              {
-                                  "topic": MQTT_AVAILABILITY_TOPIC
-                              }
-                          ],
-                          "device": {
-                              "identifiers": MQTT_DEVICE_NAME,
-                              "manufacturer": MQTT_DEVICE_MANUFACTURER,
-                              "model": MQTT_DEVICE_MODEL,
-                              "name": MQTT_DEVICE_NAME
-                          },
-                          "name": "Kettle Current Temperature",
-                          "state_topic": MQTT_STATUS_TOPIC + "/temperature",
-                          "unique_id": "kettle_temp",
-                          "unit_of_measurement": "C",
-                          "icon": "mdi:water-thermometer"
-                      }), retain=True)
-        mqttc.publish(MQTT_SENSOR_DISC_TOPIC + "/fill_level/config",
-                      json.dumps({
-                          "availability": [
-                              {
-                                  "topic": MQTT_AVAILABILITY_TOPIC
-                              }
-                          ],
-                          "device": {
-                              "identifiers": MQTT_DEVICE_NAME,
-                              "manufacturer": MQTT_DEVICE_MANUFACTURER,
-                              "model": MQTT_DEVICE_MODEL,
-                              "name": MQTT_DEVICE_NAME
-                          },
-                          "name": "Kettle Fill Level",
-                          "state_topic": MQTT_STATUS_TOPIC + "/STATE",
-                          "unique_id": "kettle_fill_level",
-                          "unit_of_measurement": "%",
-                          "icon": "mdi:cup-water",
-                          "value_template": "{{ (min(100, max(0, (((value_json.volume - " + str(lvl_calib[0]) + ") / (" + str(lvl_calib[1]) + " - " + str(lvl_calib[0]) + ")) * 100)|round(0)))) }}"
-                      }), retain=True)
-        mqttc.publish(MQTT_SENSOR_DISC_TOPIC + "/raw_fill_level/config",
-                      json.dumps({
-                          "availability": [
-                              {
-                                  "topic": MQTT_AVAILABILITY_TOPIC
-                              }
-                          ],
-                          "device": {
-                              "identifiers": MQTT_DEVICE_NAME,
-                              "manufacturer": MQTT_DEVICE_MANUFACTURER,
-                              "model": MQTT_DEVICE_MODEL,
-                              "name": MQTT_DEVICE_NAME
-                          },
-                          "name": "Kettle Water Volume",
-                          "state_topic": MQTT_STATUS_TOPIC + "/volume",
-                          "unique_id": "kettle_water_volume",
-                          "icon": "mdi:cup-water"
-                      }), retain=True)
-        mqttc.publish(MQTT_SENSOR_DISC_TOPIC + "/status/config",
-                      json.dumps({
-                          "availability": [
-                              {
-                                  "topic": MQTT_AVAILABILITY_TOPIC
-                              }
-                          ],
-                          "device": {
-                              "identifiers": MQTT_DEVICE_NAME,
-                              "manufacturer": MQTT_DEVICE_MANUFACTURER,
-                              "model": MQTT_DEVICE_MODEL,
-                              "name": MQTT_DEVICE_NAME
-                          },
-                          "name": "Kettle Status",
-                          "state_topic": MQTT_STATUS_TOPIC + "/status",
-                          "unique_id": "kettle_status",
-                          "icon": "mdi:kettle-alert"
-                      }), retain=True)
+        # publish HA discovery topics
+        mqttc.publish(
+            MQTT_SWITCH_DISC_TOPIC + "/power/config",
+            json.dumps({
+                "availability": [{"topic": MQTT_AVAILABILITY_TOPIC}],
+                "command_topic": MQTT_COMMAND_TOPIC + "/power",
+                "device": {
+                    "identifiers": MQTT_DEVICE_NAME,
+                    "manufacturer": MQTT_DEVICE_MANUFACTURER,
+                    "model": MQTT_DEVICE_MODEL,
+                    "name": MQTT_DEVICE_NAME
+                },
+                "name": "Kettle Power",
+                "state_topic": MQTT_STATUS_TOPIC + "/power",
+                "unique_id": "kettle_power",
+                "payload_on": "ON",
+                "payload_off": "OFF",
+                "icon": "mdi:kettle"
+            }),
+            retain=True
+        )
+        mqttc.publish(
+            MQTT_SWITCH_DISC_TOPIC + "/keep_warm_onoff/config",
+            json.dumps({
+                "availability": [{"topic": MQTT_AVAILABILITY_TOPIC}],
+                "device": {
+                    "identifiers": MQTT_DEVICE_NAME,
+                    "manufacturer": MQTT_DEVICE_MANUFACTURER,
+                    "model": MQTT_DEVICE_MODEL,
+                    "name": MQTT_DEVICE_NAME
+                },
+                "name": "Kettle Keep Warm",
+                "state_topic": MQTT_STATUS_TOPIC + "/keep_warm_onoff",
+                "command_topic": MQTT_COMMAND_TOPIC + "/keep_warm_onoff",
+                "unique_id": "kettle_keep_warm",
+                "payload_on": "True",
+                "payload_off": "False",
+                "icon": "mdi:kettle-steam"
+            }),
+            retain=True
+        )
+        mqttc.publish(
+            MQTT_NUMBER_DISC_TOPIC + "/set_target_temp/config",
+            json.dumps({
+                "availability": [{"topic": MQTT_AVAILABILITY_TOPIC}],
+                "device": {
+                    "identifiers": MQTT_DEVICE_NAME,
+                    "manufacturer": MQTT_DEVICE_MANUFACTURER,
+                    "model": MQTT_DEVICE_MODEL,
+                    "name": MQTT_DEVICE_NAME
+                },
+                "name": "Kettle Target Temperature",
+                "state_topic": MQTT_STATUS_TOPIC + "/set_target_temp",
+                "command_topic": MQTT_COMMAND_TOPIC + "/set_target_temp",
+                "unique_id": "kettle_target_temp",
+                "unit_of_measurement": "C",
+                "icon": "mdi:thermometer-check",
+                "max": 100,
+                "min": 30
+            }),
+            retain=True
+        )
+        mqttc.publish(
+            MQTT_SENSOR_DISC_TOPIC + "/current_temp/config",
+            json.dumps({
+                "availability": [{"topic": MQTT_AVAILABILITY_TOPIC}],
+                "device": {
+                    "identifiers": MQTT_DEVICE_NAME,
+                    "manufacturer": MQTT_DEVICE_MANUFACTURER,
+                    "model": MQTT_DEVICE_MODEL,
+                    "name": MQTT_DEVICE_NAME
+                },
+                "name": "Kettle Current Temperature",
+                "state_topic": MQTT_STATUS_TOPIC + "/temperature",
+                "unique_id": "kettle_temp",
+                "unit_of_measurement": "C",
+                "icon": "mdi:water-thermometer"
+            }),
+            retain=True
+        )
+        mqttc.publish(
+            MQTT_SENSOR_DISC_TOPIC + "/fill_level/config",
+            json.dumps({
+                "availability": [{"topic": MQTT_AVAILABILITY_TOPIC}],
+                "device": {
+                    "identifiers": MQTT_DEVICE_NAME,
+                    "manufacturer": MQTT_DEVICE_MANUFACTURER,
+                    "model": MQTT_DEVICE_MODEL,
+                    "name": MQTT_DEVICE_NAME
+                },
+                "name": "Kettle Fill Level",
+                "state_topic": MQTT_STATUS_TOPIC + "/STATE",
+                "unique_id": "kettle_fill_level",
+                "unit_of_measurement": "%",
+                "icon": "mdi:cup-water",
+                "value_template": "{{ (min(100, max(0, (((value_json.volume - " + str(lvl_calib[0]) + ") / (" + str(lvl_calib[1]) + " - " + str(lvl_calib[0]) + ")) * 100)|round(0)))) }}"
+            }),
+            retain=True
+        )
+        mqttc.publish(
+            MQTT_SENSOR_DISC_TOPIC + "/raw_fill_level/config",
+            json.dumps({
+                "availability": [{"topic": MQTT_AVAILABILITY_TOPIC}],
+                "device": {
+                    "identifiers": MQTT_DEVICE_NAME,
+                    "manufacturer": MQTT_DEVICE_MANUFACTURER,
+                    "model": MQTT_DEVICE_MODEL,
+                    "name": MQTT_DEVICE_NAME
+                },
+                "name": "Kettle Water Volume",
+                "state_topic": MQTT_STATUS_TOPIC + "/volume",
+                "unique_id": "kettle_water_volume",
+                "icon": "mdi:cup-water"
+            }),
+            retain=True
+        )
+        mqttc.publish(
+            MQTT_SENSOR_DISC_TOPIC + "/status/config",
+            json.dumps({
+                "availability": [{"topic": MQTT_AVAILABILITY_TOPIC}],
+                "device": {
+                    "identifiers": MQTT_DEVICE_NAME,
+                    "manufacturer": MQTT_DEVICE_MANUFACTURER,
+                    "model": MQTT_DEVICE_MODEL,
+                    "name": MQTT_DEVICE_NAME
+                },
+                "name": "Kettle Status",
+                "state_topic": MQTT_STATUS_TOPIC + "/status",
+                "unique_id": "kettle_status",
+                "icon": "mdi:kettle-alert"
+            }),
+            retain=True
+        )
 
         mqttc.loop_start()
 
@@ -689,7 +669,7 @@ def main_loop(host_port, imei, mqtt_broker, lvl_calib):
         if not kettle_socket.connected:
             kettle_socket.connect(host_port)
             if kettle_socket.connected:
-                print("Connected succesfully to socket on host", host_port[0])
+                print("Connected successfully to socket on host", host_port[0])
             else:
                 print("Could not connect to socket on host", host_port[0])
                 continue
@@ -698,20 +678,19 @@ def main_loop(host_port, imei, mqtt_broker, lvl_calib):
         infds, outfds, errfds = select.select(inout, inout, [], 120)
 
         if len(infds) != 0:
-            current_power = kettle.stat["power"]
-            current_cmd = kettle.stat["cmd"]
+            current_power = kettle.stat.get("power")
+            current_cmd = kettle.stat.get("cmd")
 
             k_msg = kettle_socket.receive()
             kettle.update_status(k_msg)
 
-            if current_power != kettle.stat["power"] and current_cmd != kettle.stat["power"]:
-                print("power changed: ", kettle.stat["power"])
-                mqttc.publish(MQTT_COMMAND_TOPIC + "/power", kettle.stat["power"])
-                
+            if current_power != kettle.stat.get("power") and current_cmd != kettle.stat.get("power"):
+                print("power changed: ", kettle.stat.get("power"))
+                if mqttc is not None:
+                    mqttc.publish(MQTT_COMMAND_TOPIC + "/power", kettle.stat.get("power"))
 
-            if not mqtt_broker is None:
-                mqttc.publish(MQTT_STATUS_TOPIC + "/STATE",
-                              kettle.status_json())
+            if mqttc is not None:
+                mqttc.publish(MQTT_STATUS_TOPIC + "/STATE", kettle.status_json())
                 for i in [
                     "temperature",
                     "target_temp",
@@ -723,13 +702,12 @@ def main_loop(host_port, imei, mqtt_broker, lvl_calib):
                     "keep_warm_onoff",
                     "volume",
                 ]:
-                    mqttc.publish(MQTT_STATUS_TOPIC + "/" + i, kettle.stat[i])
+                    if i in kettle.stat:
+                        mqttc.publish(MQTT_STATUS_TOPIC + "/" + i, kettle.stat[i])
 
         if len(outfds) != 0:
-            # print("we could be writing here")
             pass
         if len(errfds) != 0:
-            # print("we could be handling socket errors here")
             pass
 
         if time.time() - timestamp > MSG_KEEP_CONNECT_FREQ_SECS:
@@ -737,18 +715,14 @@ def main_loop(host_port, imei, mqtt_broker, lvl_calib):
             timestamp = time.time()
 
         time.sleep(0.2)  # build-in a little sleep
-        # print("".join("%02x " % i for i in response))
 
 
 def argparser():
     """Parses input arguments, see -h"""
     parser = argparse.ArgumentParser()
     parser.add_argument("host", nargs="?", help="kettle host or IP")
-    parser.add_argument("imei", nargs="?",
-                        help="kettle IMEI (e.g. GD0-12300-35aa)")
-    parser.add_argument(
-        "--port", help="kettle port (default 6002)", default=6002, type=int
-    )
+    parser.add_argument("imei", nargs="?", help="kettle IMEI (e.g. GD0-12300-35aa)")
+    parser.add_argument("--port", help="kettle port (default 6002)", default=6002, type=int)
 
     parser.add_argument(
         "--mqtt",
@@ -759,14 +733,21 @@ def argparser():
 
     parser.add_argument(
         "--calibrate",
-        help="Min and max volume values for the kettle water level sensor (e.g. --calibrate 0 100)",
+        help="Min and max volume values for the kettle water level sensor (e.g. --calibrate 160 1640)",
         nargs=2,
         metavar=("lvl_min", "lvl_max"),
     )
 
-    args = parser.parse_args()
+    parser.add_argument(
+        "--bcast",
+        help="Broadcast address for the subnet, defaults to 255.255.255.255 if not set",
+        type=str,
+        default=None,
+        metavar="BCAST",
+    )
 
-    main_loop((args.host, args.port), args.imei, args.mqtt, args.calibrate)
+    args = parser.parse_args()
+    main_loop((args.host, args.port), args.imei, args.mqtt, args.calibrate, args.bcast)
 
 
 if __name__ == "__main__":
