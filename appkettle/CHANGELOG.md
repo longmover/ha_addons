@@ -1,3 +1,9 @@
+## 1.0.8
+- Remove broadcast and source IP, replace with Kettle IP
+
+## 1.0/7
+- Allow source IP to be specified
+
 ## 1.0.6
 - Updated run.sh and main script to add support for custom broadcast address to support multiple HA network interfaces
 
