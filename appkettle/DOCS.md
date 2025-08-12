@@ -17,3 +17,7 @@ To do this first empty the kettle and put it on the base, make a note of the "Ke
 Once you have the min and max level values you can stop the addon, update the values in the configuration and start it again.  It should now be accurate.
 
 I hope this is of use to someone out there, the code is based on the exellect work by https://github.com/tinaught/
+
+## Custom broadcast address
+
+If your HA install has multiple network interfaces then you will need to manually set the broadcast address for the subnet the kettle is in otherwise it won't be able to communicate with HA. e.g. 192.168.0.255
